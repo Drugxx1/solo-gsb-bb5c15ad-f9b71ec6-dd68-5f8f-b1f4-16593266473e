@@ -31,6 +31,13 @@
   维护窗口的半开冲突；跳过不合格申请（撞维护封锁记
   ``STATION_UNDER_MAINTENANCE``），只将首个合格申请转为已确认预约并
   保存证书快照；预约行已删除，重复取消返回 404，不会重复补位。
+* 有效性巡检（``inspect_bookings``）：只读接口。筛选**开始时刻**落在
+  UTC 半开查询窗 ``[start, end)`` 内的已确认预约，逐条在其开始时刻
+  重建唯一有效溯源链（复用与确认/改期相同的链路门禁），要求链校验
+  通过且预约结束不晚于**当前**起点证书到期；再与预约保存的证书 id
+  与到期快照比较——链失效或截止不足记 ``invalid``，链仍有效但证书
+  id 或到期变化记 ``changed``，其余记 ``valid``；按（开始时刻,
+  预约 id）稳定排序并汇总各状态数量，全程不写库。
 """
 from __future__ import annotations
 
@@ -1073,4 +1080,147 @@ def cancel_booking(conn: sqlite3.Connection, booking_id: str) -> dict[str, Any]:
         "promotion": promotion,
         "skipped": skipped,
         "expired_waitlist_ids": expired_ids,
+    }
+
+
+# ---------------------------------------------------------------- 有效性巡检
+
+# 巡检结论：valid 链有效且快照一致 | changed 链有效但证书 id/到期变化 |
+# invalid 链失效或截止不足
+INSPECTION_VALID = "valid"
+INSPECTION_CHANGED = "changed"
+INSPECTION_INVALID = "invalid"
+
+# 巡检特有原因码；invalid 另复用 CONFLICT_INSTRUMENT_NOT_FOUND、
+# unique_chain_gate 的溯源链细分原因码与 CONFLICT_ENDS_AFTER_CERT_EXPIRY
+INSPECTION_REASON_SNAPSHOT_CHANGED = "CERTIFICATE_SNAPSHOT_CHANGED"
+
+
+def _inspect_booking_row(
+    conn: sqlite3.Connection, row: sqlite3.Row
+) -> dict[str, Any]:
+    """只读复核单条已确认预约：在其**开始时刻**重建唯一有效溯源链。
+
+    判定规则（与确认/改期写事务共用同一链路门禁与截止比较）：
+
+    1. 仪器已不存在，或开始时刻唯一有效链不成立（无有效证书 / 起点不
+       唯一 / 多候选 / 断裂 / 校验失败）-> ``invalid``，原因码取
+       ``INSTRUMENT_NOT_FOUND`` 或链细分原因码；
+    2. 链仍有效但预约结束晚于**当前**起点证书到期 -> ``invalid``
+       （``BOOKING_ENDS_AFTER_CERT_EXPIRY``，半开 ``end == valid_until``
+       允许）；
+    3. 链仍有效且截止充足，但当前起点证书 id 或到期时刻与确认时保存的
+       快照不同 -> ``changed``（``CERTIFICATE_SNAPSHOT_CHANGED``）；
+    4. 其余 -> ``valid``。
+    """
+    start_s, end_s = row["start_at"], row["end_at"]
+    instrument_code = row["instrument_code"]
+    snap_cert = row["certificate_id"]
+    snap_until = row["certificate_valid_until"]
+    item: dict[str, Any] = {
+        "booking_id": row["id"],
+        "instrument_code": instrument_code,
+        "start_at": start_s,
+        "end_at": end_s,
+        "current_certificate_id": None,
+        "current_certificate_valid_until": None,
+        "snapshot_certificate_id": snap_cert,
+        "snapshot_certificate_valid_until": snap_until,
+    }
+
+    # 1) 仪器仍存在（预约行不随仪器档案删除，防御性复核）
+    if get_instrument(conn, instrument_code) is None:
+        item.update(
+            status=INSPECTION_INVALID,
+            reason_code=CONFLICT_INSTRUMENT_NOT_FOUND,
+            reason=f"仪器不存在: {instrument_code}",
+        )
+        return item
+
+    # 2) 在预约开始时刻重建唯一有效溯源链（复用现有链路门禁，不沿用快照）
+    gate = unique_chain_gate(conn, instrument_code, _parse(start_s))
+    if not gate["ok"]:
+        item.update(
+            status=INSPECTION_INVALID,
+            reason_code=gate["reason_code"],
+            reason=(
+                f"预约开始时刻 {start_s} 仪器 {instrument_code} 的"
+                "唯一有效溯源链不可用：" + gate["reason"]
+            ),
+        )
+        return item
+
+    cert_id = gate["start_certificate_id"]
+    until_s = gate["certificate_valid_until"]
+    item["current_certificate_id"] = cert_id
+    item["current_certificate_valid_until"] = until_s
+
+    # 3) 预约结束不得晚于当前起点证书到期（半开：end == valid_until 允许）
+    if end_s > until_s:
+        item.update(
+            status=INSPECTION_INVALID,
+            reason_code=CONFLICT_ENDS_AFTER_CERT_EXPIRY,
+            reason=(
+                f"预约结束 {end_s} 晚于当前起点证书 {cert_id} 的到期时刻 "
+                f"{until_s}，证书截止不足"
+            ),
+        )
+        return item
+
+    # 4) 链仍有效且截止充足：与确认时保存的证书 id / 到期快照比较
+    if cert_id != snap_cert or until_s != snap_until:
+        changes: list[str] = []
+        if cert_id != snap_cert:
+            changes.append(f"起点证书由 {snap_cert} 变为 {cert_id}")
+        if until_s != snap_until:
+            changes.append(
+                f"证书 {cert_id} 到期时刻由 {snap_until} 变为 {until_s}"
+            )
+        item.update(
+            status=INSPECTION_CHANGED,
+            reason_code=INSPECTION_REASON_SNAPSHOT_CHANGED,
+            reason="；".join(changes),
+        )
+        return item
+
+    item.update(status=INSPECTION_VALID, reason_code=None, reason=None)
+    return item
+
+
+def inspect_bookings(
+    conn: sqlite3.Connection, start: datetime, end: datetime
+) -> dict[str, Any]:
+    """GET /api/calibration-bookings/inspection 的只读巡检计算。
+
+    筛选**开始时刻**落在 UTC 半开查询窗 ``[start, end)`` 内的已确认预约，
+    按（开始时刻, 预约 id）稳定排序逐条复核（见
+    :func:`_inspect_booking_row`），并汇总 valid / changed / invalid 数量；
+    全程只读，不写库。``start >= end`` 抛 :class:`ValidationError`（422）。
+    """
+    start_naive = to_utc_naive(start)
+    end_naive = to_utc_naive(end)
+    if start_naive >= end_naive:
+        raise ValidationError("巡检查询窗起点 start 必须严格早于终点 end")
+    lo_s, hi_s = fmt(start_naive), fmt(end_naive)
+
+    rows = conn.execute(
+        "SELECT * FROM calibration_bookings "
+        "WHERE start_at >= ? AND start_at < ? ORDER BY start_at, id",
+        (lo_s, hi_s),
+    ).fetchall()
+
+    items = [_inspect_booking_row(conn, r) for r in rows]
+    summary: dict[str, int] = {
+        "total": len(items),
+        INSPECTION_VALID: 0,
+        INSPECTION_CHANGED: 0,
+        INSPECTION_INVALID: 0,
+    }
+    for it in items:
+        summary[it["status"]] += 1
+    return {
+        "window_start": lo_s,
+        "window_end": hi_s,
+        "summary": summary,
+        "items": items,
     }

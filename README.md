@@ -59,7 +59,7 @@ curl -s -X POST http://localhost:8000/api/submissions/preflight \
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（164 个用例）
+pytest -q        # 运行测试（179 个用例）
 ```
 
 > 所有时间均按 **UTC** 解释，建议使用 `YYYY-MM-DDTHH:MM:SSZ` 格式。
@@ -162,6 +162,7 @@ station_maintenance_windows（校准工位维护封锁；UTC 半开区间，与�
 | **POST** | **`/api/calibration-bookings`** | **确认校准工位预约（同一写事务内重查占用与证书截止，冲突 409）** |
 | **POST** | **`/api/calibration-bookings/reschedule`** | **批量改期 2～10 条已有预约（同一写事务核验，冲突 409 整体回滚）** |
 | **GET** | **`/api/calibration-bookings?instrument=`** | **预约列表（可按仪器筛选）** |
+| **GET** | **`/api/calibration-bookings/inspection?start=&end=`** | **已确认预约有效性巡检：UTC 半开窗筛选，逐条在开始时刻只读复核唯一有效链与证书快照（valid/changed/invalid）** |
 | **POST** | **`/api/calibration-bookings/{booking_id}/waitlist`** | **登记候补：沿用该预约起止时段，按登记先后排队（预约不存在 404）** |
 | **GET** | **`/api/calibration-waitlist?booking_id=&instrument=&status=`** | **候补状态查询（队列名次、终态原因）** |
 | **DELETE** | **`/api/calibration-bookings/{booking_id}`** | **取消预约：同一写事务内释放占用并按候补队列补位（避开维护封锁；重复取消 404，不重复补位）** |
@@ -643,6 +644,70 @@ curl -X DELETE http://localhost:8000/api/calibration-bookings/BK-DEMO-20260620-W
 预约不存在或已取消返回 **404**（`BOOKING_NOT_FOUND`）——**重复
 取消不会重复补位**；补位在同一 `BEGIN IMMEDIATE` 写事务内串行化，
 并发取消同一预约恰有一个成功。
+
+**⑧ 已确认预约有效性巡检（GET /api/calibration-bookings/inspection，只读）。**
+证书与溯源边日后可能发生修订（证书改期/续期、溯源关系调整、摘要更正等），
+需要批量核查“历史上确认过的预约，按当前数据复核是否仍然成立”。传入 UTC
+半开查询窗 `[start, end)`，服务端筛选**开始时刻**落在窗内的已确认预约
+（开始恰等于窗起点计入、恰等于窗终点不计入），按**开始时刻升序、预约 ID
+次序**稳定排序后逐条只读复核（全程不写库）：
+
+1. 对每条预约在其**开始时刻**重建该仪器的**唯一有效溯源链**（复用与确认/
+   改期相同的链路门禁 `unique_chain_gate`，绝不沿用预约保存的旧快照）；
+2. 要求链校验通过（唯一成链且零 ERROR）且预约**结束不晚于当前起点证书
+   `valid_until`**（半开：结束恰等于到期时刻允许）；
+3. 再与预约保存的证书 ID 与到期快照比较：
+
+   - 链失效（仪器不存在 / 无有效证书 / 起点不唯一 / 多候选 / 断裂 /
+     校验失败）或**截止不足**（结束晚于当前证书到期）→ `invalid`；
+   - 链仍有效且截止充足，但当前**证书 ID 或到期时刻**与快照不同 →
+     `changed`（`reason_code=CERTIFICATE_SNAPSHOT_CHANGED`，中文原因
+     逐项说明“起点证书由 X 变为 Y”“到期时刻由 X 变为 Y”）；
+   - 其余 → `valid`。
+
+每条预约返回状态、机器可读原因码、**当前**起点证书（id + 到期；链不可用时
+为 `null`）及确认时的**原快照**（id + 到期）；顶层 `summary` 汇总
+`total / valid / changed / invalid` 数量。查询窗起点不早于终点
+（`start >= end`）或缺参数返回 **422**（中文原因）。
+
+```bash
+curl -G "http://localhost:8000/api/calibration-bookings/inspection" \
+  --data-urlencode "start=2026-06-20T00:00:00Z" \
+  --data-urlencode "end=2026-06-21T00:00:00Z"
+```
+
+```jsonc
+{
+  "window_start": "2026-06-20T00:00:00Z",
+  "window_end": "2026-06-21T00:00:00Z",
+  "summary": {"total": 1, "valid": 1, "changed": 0, "invalid": 0},
+  "items": [
+    {
+      "booking_id": "BK-DEMO-20260620-W1",
+      "instrument_code": "INST-W1",
+      "start_at": "2026-06-20T09:00:00Z",
+      "end_at": "2026-06-20T10:00:00Z",
+      "status": "valid",
+      "reason_code": null,
+      "reason": null,
+      "current_certificate_id": "CW1-1",              // 复核时重建出的当前起点证书
+      "current_certificate_valid_until": "2027-01-01T00:00:00Z",
+      "snapshot_certificate_id": "CW1-1",            // 预约确认时保存的原快照
+      "snapshot_certificate_valid_until": "2027-01-01T00:00:00Z"
+    }
+  ]
+}
+```
+
+`invalid` 的 `reason_code` 与确认/改期接口保持一致并更细：
+`INSTRUMENT_NOT_FOUND` / `NO_ACTIVE_CERTIFICATE` /
+`MULTIPLE_ACTIVE_CERTIFICATES` / `MULTIPLE_VALID_CHAINS` /
+`CHAIN_BROKEN` / `ALL_CHAINS_FAILED_CHECKS` / `CHAIN_VALIDATION_FAILED`
+（以上为链失效）或 `BOOKING_ENDS_AFTER_CERT_EXPIRY`（链有效但截止不足）。
+典型场景：将某条预约的起点证书有效期提前但仍覆盖预约结束，巡检结果为
+`changed`；若提前到预约结束之前则为 `invalid`
+（`BOOKING_ENDS_AFTER_CERT_EXPIRY`）；以新证书无缝替换旧起点证书
+（两证首尾相接、不断档）则为 `changed`（当前证书 ID 已切换）。
 
 #### 4.3）校准工位维护封锁（maintenance windows）
 
@@ -1370,6 +1435,24 @@ curl "http://localhost:8000/api/calibration-waitlist?booking_id=BK-DEMO-20260620
 # INST-T1 的候补     -> expired
 ```
 
+已确认预约有效性巡检示例（只读；演示预约在 2026-06-20 当天窗内为 valid）：
+
+```bash
+# 巡检 2026-06-20 当天开始的全部已确认预约（UTC 半开窗 [start, end)）
+curl -G "http://localhost:8000/api/calibration-bookings/inspection" \
+  --data-urlencode "start=2026-06-20T00:00:00Z" \
+  --data-urlencode "end=2026-06-21T00:00:00Z"
+# summary: {"total":1,"valid":1,"changed":0,"invalid":0}
+# items[0]: BK-DEMO-20260620-W1 / INST-W1 / status=valid
+#   current CW1-1 @ 2027-01-01 == 快照 CW1-1 @ 2027-01-01
+
+# 窗起点不早于终点 -> 422
+curl -G "http://localhost:8000/api/calibration-bookings/inspection" \
+  --data-urlencode "start=2026-06-21T00:00:00Z" \
+  --data-urlencode "end=2026-06-21T00:00:00Z"
+# 422 {"detail":"巡检查询窗起点 start 必须严格早于终点 end"}
+```
+
 ## 七、溯源算法说明
 
 1. 取目标仪器在 `at` 生效（`valid_from <= at <= valid_until`）的证书作为起点；
@@ -1439,6 +1522,15 @@ curl "http://localhost:8000/api/calibration-waitlist?booking_id=BK-DEMO-20260620
     才追加 vN+1，同内容重交不增版；任一步失败整体回滚。批量预检在独立
     事务中模拟并回滚，绝不留下版本。版本列表与指定两版字段差异可按证书
     ID 查询，引用不存在的证书或版本号返回 404。
+14. 已确认预约有效性巡检：只读。按 UTC 半开窗 `[start, end)` 筛选预约
+    **开始时刻**（`start <= start_at < end`），按（开始时刻, 预约 ID）
+    稳定排序；对每条预约在其开始时刻复用步骤 1~5 重建唯一有效溯源链
+    （复用 `unique_chain_gate`，不沿用预约保存的快照），链校验通过且
+    预约结束不晚于**当前**起点证书到期后，再与预约保存的证书 id 与到期
+    快照比较——链失效（仪器不存在/无有效证书/起点不唯一/多候选/断裂/
+    校验失败）或截止不足记 `invalid`，链仍有效但证书 id 或到期变化记
+    `changed`，其余记 `valid`；返回逐条状态、原因码、当前证书与原快照
+    并汇总各状态数量；`start >= end` 返回 422。全程只读，不写库。
 
 ## 八、项目结构
 
@@ -1457,7 +1549,9 @@ app/
                      写事务内重查确认（409 冲突）、批量改期（旧占用整体
                      排除后核验新时段，409 整体回滚）、候补登记/排队/状态
                      查询与取消补位（同一写事务内释放占用、按队列顺序逐条
-                     重验并只补位首个合格申请，改期使未补位候补失效）与
+                     重验并只补位首个合格申请，改期使未补位候补失效）、
+                     已确认预约有效性巡检（半开窗筛选，逐条只读复核唯一
+                     有效链与证书快照，valid/changed/invalid）与
                      预约持久化/列表；确认/改期/补位均在写事务内重查
                      maintenance.py 中的活跃维护封锁窗口
   maintenance.py     校准工位维护封锁：UTC 半开区间维护窗口登记（同一写
@@ -1471,7 +1565,8 @@ app/
                      trace(report + 时间窗覆盖 + 停用影响评估 + 批次共同溯源核查
                      + 测量相容性评估) /
                      calibration（工位空档 GET + 预约确认 POST + 批量改期
-                     POST + 预约列表 GET + 候补登记 POST + 候补状态查询 GET
+                     POST + 预约列表 GET + 已确认预约有效性巡检 GET +
+                     候补登记 POST + 候补状态查询 GET
                      + 取消补位 DELETE）/
                      maintenance_windows（维护封锁登记 POST + 列表 GET +
                      撤销 DELETE）/
@@ -1483,6 +1578,9 @@ tests/test_coverage.py       10 个仪器时间窗覆盖查询测试
 tests/test_common_trace.py   12 个批次共同溯源核查测试
 tests/test_measurement_compatibility.py  14 个测量相容性评估测试
 tests/test_calibration.py    28 个校准工位预约测试
+tests/test_inspection.py     15 个已确认预约有效性巡检测试（半开窗筛选、
+                             422 入参、valid/changed/invalid 三态原因码、
+                             稳定排序与汇总、只读不写库）
 tests/test_reschedule.py     16 个批量改期测试
 tests/test_revisions.py      15 个证书修订历史测试
 tests/test_waitlist.py       20 个候补登记/查询/取消补位测试
