@@ -4,6 +4,7 @@
 * ``POST /api/calibration-bookings``            写事务内重查占用、维护封锁与证书截止后确认（409 冲突）；
 * ``POST /api/calibration-bookings/reschedule`` 2～10 条已有预约批量改期（同一写事务核验，含维护封锁，409 整体回滚）；
 * ``GET  /api/calibration-bookings``            按仪器（可选）查询已确认预约；
+* ``GET  /api/calibration-bookings/inspection`` 已确认预约有效性巡检（只读，按 UTC 半开窗逐条复核溯源链与证书快照）；
 * ``POST /api/calibration-bookings/{booking_id}/waitlist`` 对指定已确认预约登记候补（沿用该预约时段排队）；
 * ``GET  /api/calibration-waitlist``            候补状态查询（按目标预约/仪器/状态筛选）；
 * ``DELETE /api/calibration-bookings/{booking_id}`` 取消预约并在同一写事务内按候补队列补位（避开维护窗口；重复取消 404）。
@@ -22,6 +23,7 @@ from .. import booking, crud
 from ..database import get_conn_ctx, get_db
 from ..schemas import (
     CalibrationBookingIn,
+    CalibrationBookingInspectionOut,
     CalibrationBookingOut,
     CalibrationCancelOut,
     CalibrationRescheduleIn,
@@ -181,6 +183,45 @@ def list_calibration_bookings(
     if instrument is not None and crud.get_instrument(db, instrument) is None:
         raise HTTPException(404, f"仪器不存在: {instrument}")
     return booking.list_bookings(db, instrument)
+
+
+@router.get(
+    "/calibration-bookings/inspection",
+    response_model=CalibrationBookingInspectionOut,
+    summary="已确认预约有效性巡检（只读，按 UTC 半开时间窗逐条复核）",
+)
+def inspect_calibration_bookings(
+    start: datetime = Query(
+        ...,
+        alias="start",
+        description="UTC 巡检查询窗起点（含），如 2026-06-20T00:00:00Z",
+    ),
+    end: datetime = Query(
+        ...,
+        alias="end",
+        description="UTC 巡检查询窗终点（不含），如 2026-06-21T00:00:00Z",
+    ),
+    db: Connection = Depends(get_db),
+):
+    """有效性巡检（**只读**，不写库）：按 UTC 半开时间窗 ``[start, end)``
+    筛选**开始时刻**落在窗内的已确认预约，逐条复核：
+
+    1. 在该预约**开始时刻**重建其仪器的唯一有效溯源链（复用
+       ``/api/reports`` 同一引擎的唯一链门禁，重查而非沿用确认时快照）；
+    2. 要求链校验通过且预约结束不晚于**当前**起点证书 ``valid_until``；
+    3. 再与预约确认时保存的证书 ID 与到期快照比较。
+
+    判定：链失效或截止不足 → ``invalid``（原因码为仪器缺失、溯源链细分
+    原因码或 ``BOOKING_ENDS_AFTER_CERT_EXPIRY``）；链仍有效但证书 ID 或
+    到期与快照不一致 → ``changed``（``CERTIFICATE_SNAPSHOT_CHANGED``）；
+    完全一致 → ``valid``。每条返回状态、原因码、当前证书与原快照，按
+    （开始时刻, 预约 ID）稳定排序，并汇总各状态数量。查询窗起点不早于
+    终点（``start >= end``）返回 **422**。
+    """
+    try:
+        return booking.inspect_bookings(db, start, end)
+    except crud.ValidationError as exc:
+        raise HTTPException(422, str(exc))
 
 
 def _conflict_http(exc: booking.BookingConflict) -> HTTPException:

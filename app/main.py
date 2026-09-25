@@ -144,6 +144,11 @@ def root():
                 "（2～10 条已有预约批量改期，同一写事务核验，冲突 409 整体回滚）"
             ),
             "calibration_booking_list": "GET /api/calibration-bookings?instrument=",
+            "calibration_booking_inspection": (
+                "GET /api/calibration-bookings/inspection?start=&end="
+                "（已确认预约有效性巡检：按 UTC 半开窗逐条复核溯源链与证书"
+                "快照，valid/changed/invalid 汇总，只读不写库）"
+            ),
             "calibration_waitlist_register": (
                 "POST /api/calibration-bookings/{booking_id}/waitlist"
                 "（登记候补，沿用该预约时段按登记先后排队）"

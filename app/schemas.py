@@ -1067,6 +1067,78 @@ class CalibrationSlotsOut(BaseModel):
     )
 
 
+# ---------- 校准预约有效性巡检输出 ----------
+
+class CalibrationInspectionCounts(BaseModel):
+    """巡检结果各状态数量汇总。"""
+
+    valid: int = Field(0, description="链仍有效且与确认时快照一致的预约数")
+    changed: int = Field(
+        0, description="链仍有效但当前起点证书 ID 或到期与快照不一致的预约数"
+    )
+    invalid: int = Field(0, description="链失效或预约结束晚于当前证书到期的预约数")
+
+
+class CalibrationBookingInspectionItem(BaseModel):
+    """一条已确认预约的巡检复核结果（只读，在预约开始时刻重建链）。"""
+
+    booking_id: str
+    instrument_code: str
+    start_at: datetime = Field(..., description="预约占用起点（UTC，含）")
+    end_at: datetime = Field(..., description="预约占用终点（UTC，不含）")
+    status: str = Field(
+        ...,
+        description=(
+            "valid 链仍有效且与快照一致 | changed 链仍有效但证书 ID 或"
+            "到期变化 | invalid 链失效或截止不足"
+        ),
+    )
+    reason_code: Optional[str] = Field(
+        None,
+        description=(
+            "invalid：INSTRUMENT_NOT_FOUND | 溯源链细分原因码"
+            "（NO_ACTIVE_CERTIFICATE / MULTIPLE_ACTIVE_CERTIFICATES / "
+            "MULTIPLE_VALID_CHAINS / CHAIN_BROKEN / "
+            "ALL_CHAINS_FAILED_CHECKS / CHAIN_VALIDATION_FAILED）| "
+            "BOOKING_ENDS_AFTER_CERT_EXPIRY；"
+            "changed：CERTIFICATE_SNAPSHOT_CHANGED；valid 为 null"
+        ),
+    )
+    reason: Optional[str] = Field(None, description="中文原因说明")
+    current_certificate_id: Optional[str] = Field(
+        None,
+        description="复核时唯一有效链的当前起点证书 id（链失效时为 null）",
+    )
+    current_certificate_valid_until: Optional[datetime] = Field(
+        None, description="当前起点证书有效期截止（链失效时为 null）"
+    )
+    snapshot_certificate_id: str = Field(
+        ..., description="预约确认时保存的起点证书 id 快照"
+    )
+    snapshot_certificate_valid_until: datetime = Field(
+        ..., description="预约确认时保存的起点证书到期时刻快照"
+    )
+
+
+class CalibrationBookingInspectionOut(BaseModel):
+    """GET /api/calibration-bookings/inspection 响应（只读巡检，不写库）。"""
+
+    window_start: datetime = Field(
+        ..., description="巡检查询窗起点（UTC，含）：筛选 start_at >= 该时刻的预约"
+    )
+    window_end: datetime = Field(
+        ..., description="巡检查询窗终点（UTC，不含）：筛选 start_at < 该时刻的预约"
+    )
+    booking_count: int = Field(..., description="窗内被复核的预约总数")
+    status_counts: CalibrationInspectionCounts = Field(
+        ..., description="各状态（valid / changed / invalid）数量汇总"
+    )
+    results: List[CalibrationBookingInspectionItem] = Field(
+        default_factory=list,
+        description="逐条复核结果，按（预约开始时刻, 预约 ID）稳定排序",
+    )
+
+
 # ---------- 校准工位维护封锁输出 ----------
 
 class MaintenanceWindowOut(BaseModel):

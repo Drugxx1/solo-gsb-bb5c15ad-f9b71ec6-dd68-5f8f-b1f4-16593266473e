@@ -59,7 +59,7 @@ curl -s -X POST http://localhost:8000/api/submissions/preflight \
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（164 个用例）
+pytest -q        # 运行测试（178 个用例）
 ```
 
 > 所有时间均按 **UTC** 解释，建议使用 `YYYY-MM-DDTHH:MM:SSZ` 格式。
@@ -162,6 +162,7 @@ station_maintenance_windows（校准工位维护封锁；UTC 半开区间，与�
 | **POST** | **`/api/calibration-bookings`** | **确认校准工位预约（同一写事务内重查占用与证书截止，冲突 409）** |
 | **POST** | **`/api/calibration-bookings/reschedule`** | **批量改期 2～10 条已有预约（同一写事务核验，冲突 409 整体回滚）** |
 | **GET** | **`/api/calibration-bookings?instrument=`** | **预约列表（可按仪器筛选）** |
+| **GET** | **`/api/calibration-bookings/inspection?start=&end=`** | **已确认预约有效性巡检（只读）：按 UTC 半开窗筛选，逐条在开始时刻重建唯一有效链并与证书快照比较，汇总 valid/changed/invalid** |
 | **POST** | **`/api/calibration-bookings/{booking_id}/waitlist`** | **登记候补：沿用该预约起止时段，按登记先后排队（预约不存在 404）** |
 | **GET** | **`/api/calibration-waitlist?booking_id=&instrument=&status=`** | **候补状态查询（队列名次、终态原因）** |
 | **DELETE** | **`/api/calibration-bookings/{booking_id}`** | **取消预约：同一写事务内释放占用并按候补队列补位（避开维护封锁；重复取消 404，不重复补位）** |
@@ -643,6 +644,73 @@ curl -X DELETE http://localhost:8000/api/calibration-bookings/BK-DEMO-20260620-W
 预约不存在或已取消返回 **404**（`BOOKING_NOT_FOUND`）——**重复
 取消不会重复补位**；补位在同一 `BEGIN IMMEDIATE` 写事务内串行化，
 并发取消同一预约恰有一个成功。
+
+**⑧ 预约有效性巡检（GET /api/calibration-bookings/inspection，只读）。**
+证书可能被修订、换证或停用，确认时保存的证书快照可能已不再反映当前
+溯源状态。巡检接口按 **UTC 半开时间窗 `[start, end)`** 筛选**开始时刻**
+落在窗内（`start <= start_at < end`）的已确认预约，**只读**逐条复核
+（不写任何业务数据，可安全重复调用）：
+
+1. 在每条预约的**开始时刻**重建该仪器的唯一有效溯源链（复用
+`/api/reports` 同一引擎的唯一链门禁，重查而非沿用确认时快照）；
+2. 要求链校验通过，且预约结束不晚于**当前**起点证书 `valid_until`；
+3. 再与预约确认时保存的证书 ID 与到期快照比较。
+
+判定规则：
+
+| 状态 | 条件 | `reason_code` |
+| --- | --- | --- |
+| `invalid` | 仪器已不存在 / 开始时刻唯一有效链不成立 / 预约结束晚于当前起点证书到期 | `INSTRUMENT_NOT_FOUND`、溯源链细分原因码（`NO_ACTIVE_CERTIFICATE` 等）或 `BOOKING_ENDS_AFTER_CERT_EXPIRY` |
+| `changed` | 链仍有效且截止充足，但当前起点证书 ID 或到期与快照不一致 | `CERTIFICATE_SNAPSHOT_CHANGED` |
+| `valid` | 链仍有效且当前证书 ID、到期与快照完全一致 | `null` |
+
+```bash
+curl -G "http://localhost:8000/api/calibration-bookings/inspection" \
+  --data-urlencode "start=2026-06-20T00:00:00Z" \
+  --data-urlencode "end=2026-06-21T00:00:00Z"
+```
+
+```jsonc
+{
+  "window_start": "2026-06-20T00:00:00Z",   // 半开窗 [start, end)：筛选 start_at 落在窗内的预约
+  "window_end": "2026-06-21T00:00:00Z",
+  "booking_count": 2,
+  "status_counts": {"valid": 1, "changed": 1, "invalid": 0},
+  "results": [                               // 按（开始时刻, 预约 ID）稳定排序
+    {
+      "booking_id": "BK-DEMO-20260620-W1",
+      "instrument_code": "INST-W1",
+      "start_at": "2026-06-20T09:00:00Z",
+      "end_at": "2026-06-20T10:00:00Z",
+      "status": "valid",
+      "reason_code": null,
+      "reason": null,
+      "current_certificate_id": "CW1-1",     // 复核时当前起点证书
+      "current_certificate_valid_until": "2027-01-01T00:00:00Z",
+      "snapshot_certificate_id": "CW1-1",    // 确认时保存的原快照
+      "snapshot_certificate_valid_until": "2027-01-01T00:00:00Z"
+    },
+    {
+      "booking_id": "BK-20260925-xxxxxxxxxxxx",
+      "instrument_code": "INST-W2",
+      "start_at": "2026-06-20T11:00:00Z",
+      "end_at": "2026-06-20T12:00:00Z",
+      "status": "changed",                    // 链仍有效，但证书截止被修订
+      "reason_code": "CERTIFICATE_SNAPSHOT_CHANGED",
+      "reason": "预约 BK-20260925-xxxxxxxxxxxx 的溯源链仍有效，但起点证书 CW2-1 的有效期截止由快照 2027-02-01T00:00:00Z 变为 2026-12-01T00:00:00Z，与确认时保存的快照不一致",
+      "current_certificate_id": "CW2-1",
+      "current_certificate_valid_until": "2026-12-01T00:00:00Z",
+      "snapshot_certificate_id": "CW2-1",
+      "snapshot_certificate_valid_until": "2027-02-01T00:00:00Z"
+    }
+  ]
+}
+```
+
+链失效（`invalid` 且因链不可用）时 `current_certificate_id` /
+`current_certificate_valid_until` 为 `null`，原快照仍随结果返回以便
+对照。查询窗起点不早于终点（`start >= end`）或缺少 `start`/`end`
+返回 **422**（中文原因）；时间入参按 UTC 解释，建议统一用 `...Z` 格式。
 
 #### 4.3）校准工位维护封锁（maintenance windows）
 
@@ -1370,6 +1438,20 @@ curl "http://localhost:8000/api/calibration-waitlist?booking_id=BK-DEMO-20260620
 # INST-T1 的候补     -> expired
 ```
 
+预约有效性巡检示例（只读）：对 2026-06-20 当天开始的已确认预约逐条复核
+——演示预约 `BK-DEMO-20260620-W1` 的链仍有效且与确认时快照一致
+（`valid`）；若之后修订了某张起点证书（如缩短 `valid_until`），同一
+查询会把对应预约标为 `changed`（`CERTIFICATE_SNAPSHOT_CHANGED`）：
+
+```bash
+curl -G "http://localhost:8000/api/calibration-bookings/inspection" \
+  --data-urlencode "start=2026-06-20T00:00:00Z" \
+  --data-urlencode "end=2026-06-21T00:00:00Z"
+# status_counts={"valid":1,"changed":0,"invalid":0}
+# results[0]: BK-DEMO-20260620-W1 status=valid
+#   current_certificate_id=CW1-1 == snapshot_certificate_id
+```
+
 ## 七、溯源算法说明
 
 1. 取目标仪器在 `at` 生效（`valid_from <= at <= valid_until`）的证书作为起点；
@@ -1439,6 +1521,12 @@ curl "http://localhost:8000/api/calibration-waitlist?booking_id=BK-DEMO-20260620
     才追加 vN+1，同内容重交不增版；任一步失败整体回滚。批量预检在独立
     事务中模拟并回滚，绝不留下版本。版本列表与指定两版字段差异可按证书
     ID 查询，引用不存在的证书或版本号返回 404。
+14. 预约有效性巡检：按 UTC 半开窗 `[start, end)` 筛选开始时刻落在窗内
+    的已确认预约，逐条在其开始时刻复用步骤 1~5 的唯一链门禁重建当前
+    唯一有效溯源链（只读，不写库）。链不成立或预约结束晚于当前起点
+    证书 `valid_until` 标记 `invalid`；链仍有效但当前起点证书 ID 或
+    到期与确认时保存的快照不一致标记 `changed`；完全一致标记 `valid`。
+    结果按（开始时刻, 预约 ID）稳定排序并汇总各状态数量。
 
 ## 八、项目结构
 
@@ -1459,7 +1547,9 @@ app/
                      查询与取消补位（同一写事务内释放占用、按队列顺序逐条
                      重验并只补位首个合格申请，改期使未补位候补失效）与
                      预约持久化/列表；确认/改期/补位均在写事务内重查
-                     maintenance.py 中的活跃维护封锁窗口
+                     maintenance.py 中的活跃维护封锁窗口；有效性巡检
+                     （只读，按 UTC 半开窗逐条在开始时刻重建唯一有效链
+                     并与确认时证书快照比较，valid/changed/invalid 汇总）
   maintenance.py     校准工位维护封锁：UTC 半开区间维护窗口登记（同一写
                      事务内对既有预约与活跃维护窗口查重，409 附冲突 ID，
                      首尾相接允许、失败不写入）、列表（状态/时间窗筛选）、
@@ -1471,8 +1561,8 @@ app/
                      trace(report + 时间窗覆盖 + 停用影响评估 + 批次共同溯源核查
                      + 测量相容性评估) /
                      calibration（工位空档 GET + 预约确认 POST + 批量改期
-                     POST + 预约列表 GET + 候补登记 POST + 候补状态查询 GET
-                     + 取消补位 DELETE）/
+                     POST + 预约列表 GET + 有效性巡检 GET + 候补登记 POST
+                     + 候补状态查询 GET + 取消补位 DELETE）/
                      maintenance_windows（维护封锁登记 POST + 列表 GET +
                      撤销 DELETE）/
                      export / admin
@@ -1488,5 +1578,7 @@ tests/test_revisions.py      15 个证书修订历史测试
 tests/test_waitlist.py       20 个候补登记/查询/取消补位测试
 tests/test_maintenance.py    20 个工位维护封锁登记/列表/撤销及对空档/确认/
                              改期/取消补位的半开封锁联动测试
+tests/test_inspection.py     14 个预约有效性巡检测试（半开窗筛选、
+                             valid/changed/invalid 判定、稳定排序与汇总）
 Dockerfile · docker-compose.yml · requirements.txt
 ```
